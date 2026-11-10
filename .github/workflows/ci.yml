@@ -1,0 +1,128 @@
+name: ci-cd
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+  security-events: write
+
+env:
+  REGISTRY: ghcr.io
+  API_IMAGE: ghcr.io/${{ github.repository_owner }}/myshop-api
+  WEB_IMAGE: ghcr.io/${{ github.repository_owner }}/myshop-web
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    defaults: { run: { working-directory: backend } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with: { dotnet-version: 10.0.x }
+      - run: dotnet restore
+      - run: dotnet build --no-restore -c Release -warnaserror
+      - run: dotnet test --no-build -c Release --collect:"XPlat Code Coverage" --logger trx
+      - name: Vulnerable packages
+        run: dotnet list package --vulnerable --include-transitive 2>&1 | tee vuln.txt && ! grep -q -E "High|Critical" vuln.txt
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults: { run: { working-directory: web } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm, cache-dependency-path: web/package-lock.json }
+      - run: npm ci
+      - run: npm run lint
+      - run: npx tsc --noEmit
+      - run: npm run build
+      - run: npm audit --audit-level=high --omit=dev
+
+  images:
+    needs: [backend, frontend]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: meta
+        run: echo "tag=sha-${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+      - uses: docker/login-action@v3
+        with: { registry: ghcr.io, username: "${{ github.actor }}", password: "${{ secrets.GITHUB_TOKEN }}" }
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: backend
+          push: true
+          tags: ${{ env.API_IMAGE }}:${{ steps.meta.outputs.tag }}
+          cache-from: type=gha,scope=api
+          cache-to: type=gha,mode=max,scope=api
+      - uses: docker/build-push-action@v6
+        with:
+          context: web
+          push: true
+          tags: ${{ env.WEB_IMAGE }}:${{ steps.meta.outputs.tag }}
+          build-args: |
+            NEXT_PUBLIC_API_URL=${{ vars.PUBLIC_API_URL }}
+            NEXT_PUBLIC_SITE_URL=${{ vars.PUBLIC_SITE_URL }}
+          cache-from: type=gha,scope=web
+          cache-to: type=gha,mode=max,scope=web
+      - name: Trivy scan (fail on HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.API_IMAGE }}:${{ steps.meta.outputs.tag }}
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+
+  deploy-staging:
+    needs: images
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-kubectl@v4
+      - name: Deploy
+        env:
+          KUBECONFIG_DATA: ${{ secrets.KUBECONFIG_STAGING }}
+          TAG: ${{ needs.images.outputs.tag }}
+        run: |
+          echo "$KUBECONFIG_DATA" | base64 -d > kubeconfig && export KUBECONFIG=$PWD/kubeconfig
+          cd deploy/k8s
+          kustomize edit set image ghcr.io/OWNER/myshop-api=${{ env.API_IMAGE }}:$TAG ghcr.io/OWNER/myshop-web=${{ env.WEB_IMAGE }}:$TAG
+          kubectl -n myshop-staging apply -k .
+          kubectl -n myshop-staging rollout status deploy/myshop-api --timeout=5m
+          kubectl -n myshop-staging rollout status deploy/myshop-web --timeout=5m
+      - name: Smoke test + load test (k6)
+        uses: grafana/k6-action@v0.3.1
+        with:
+          filename: tests/load/k6-catalog.js
+          flags: -e API=${{ vars.STAGING_API_URL }} --duration 1m --vus 50
+      - name: OWASP ZAP baseline scan
+        uses: zaproxy/action-baseline@v0.14.0
+        with: { target: "${{ vars.STAGING_SITE_URL }}", fail_action: false }
+
+  deploy-production:
+    needs: [images, deploy-staging]
+    runs-on: ubuntu-latest
+    environment: production # bật "Required reviewers" để duyệt thủ công trước khi lên production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-kubectl@v4
+      - name: Rolling / canary deploy
+        env:
+          KUBECONFIG_DATA: ${{ secrets.KUBECONFIG_PRODUCTION }}
+          TAG: ${{ needs.images.outputs.tag }}
+        run: |
+          echo "$KUBECONFIG_DATA" | base64 -d > kubeconfig && export KUBECONFIG=$PWD/kubeconfig
+          cd deploy/k8s
+          kustomize edit set image ghcr.io/OWNER/myshop-api=${{ env.API_IMAGE }}:$TAG ghcr.io/OWNER/myshop-web=${{ env.WEB_IMAGE }}:$TAG
+          kubectl -n myshop apply -k .
+          kubectl -n myshop rollout status deploy/myshop-api --timeout=10m || (kubectl -n myshop rollout undo deploy/myshop-api && exit 1)
+          kubectl -n myshop rollout status deploy/myshop-web --timeout=10m || (kubectl -n myshop rollout undo deploy/myshop-web && exit 1)

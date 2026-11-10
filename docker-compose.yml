@@ -1,0 +1,89 @@
+# Môi trường đầy đủ cho dev/demo: SQL Server + Redis + Elasticsearch + API + Web + Prometheus + Grafana.
+# Chạy: cp .env.example .env  (điền giá trị) → docker compose up -d --build
+name: myshop
+
+services:
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:?set in .env}
+      MSSQL_PID: Developer
+    ports: ["1433:1433"]
+    volumes: [sqldata:/var/opt/mssql]
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P \"$$MSSQL_SA_PASSWORD\" -Q 'SELECT 1' || exit 1"]
+      interval: 10s
+      retries: 12
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    ports: ["6379:6379"]
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.3
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false" # chỉ cho dev; production bật security + TLS
+      ES_JAVA_OPTS: -Xms512m -Xmx512m
+    ports: ["9200:9200"]
+    volumes: [esdata:/usr/share/elasticsearch/data]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:9200/_cluster/health || exit 1"]
+      interval: 10s
+      retries: 12
+
+  api:
+    build: ./backend
+    depends_on:
+      sqlserver: { condition: service_healthy }
+      redis: { condition: service_started }
+      elasticsearch: { condition: service_healthy }
+    environment:
+      ASPNETCORE_ENVIRONMENT: Staging
+      Database__Provider: SqlServer
+      Database__AutoCreate: "true"
+      ConnectionStrings__Shop: Server=sqlserver;Database=MyShop;User Id=sa;Password=${MSSQL_SA_PASSWORD};TrustServerCertificate=True
+      ConnectionStrings__Redis: redis:6379
+      Elasticsearch__Url: http://elasticsearch:9200
+      Jwt__SigningKey: ${JWT_SIGNING_KEY:?set in .env}
+      Webhooks__EnableMockPay: "true"
+      Webhooks__Secrets__mockpay: ${WEBHOOK_SECRET_MOCKPAY:?set in .env}
+      Webhooks__Secrets__ghn: ${WEBHOOK_SECRET_GHN:?set in .env}
+      App__FrontendUrl: http://localhost:3000
+      App__CorsOrigins__0: http://localhost:3000
+      Seed__Enabled: "true"
+      Seed__AdminEmail: ${SEED_ADMIN_EMAIL:-admin@myshop.test}
+      Seed__AdminPassword: ${SEED_ADMIN_PASSWORD:?set in .env}
+    ports: ["5080:8080"]
+
+  web:
+    build:
+      context: ./web
+      args:
+        NEXT_PUBLIC_API_URL: http://localhost:5080
+        NEXT_PUBLIC_SITE_URL: http://localhost:3000
+    environment:
+      API_INTERNAL_URL: http://api:8080
+    depends_on: [api]
+    ports: ["3000:3000"]
+
+  prometheus:
+    image: prom/prometheus:v2.55.0
+    volumes:
+      - ./deploy/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
+    ports: ["9090:9090"]
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set in .env}
+    volumes:
+      - ./deploy/monitoring/grafana:/etc/grafana/provisioning:ro
+    ports: ["3001:3000"]
+
+volumes:
+  sqldata:
+  esdata:

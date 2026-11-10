@@ -1,0 +1,100 @@
+# API: Deployment + Service + HPA + PDB. Image tag do CI thay thế (kustomize edit set image).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: myshop-api
+  labels: { app: myshop-api }
+spec:
+  replicas: 3
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxSurge: 1, maxUnavailable: 0 }
+  selector:
+    matchLabels: { app: myshop-api }
+  template:
+    metadata:
+      labels: { app: myshop-api }
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: /metrics
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: { type: RuntimeDefault }
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector: { matchLabels: { app: myshop-api } }
+      containers:
+        - name: api
+          image: ghcr.io/OWNER/myshop-api:latest
+          ports: [{ containerPort: 8080, name: http }]
+          envFrom:
+            - configMapRef: { name: myshop-api-config }
+            - secretRef: { name: myshop-api-secrets }
+          resources:
+            requests: { cpu: 250m, memory: 256Mi }
+            limits: { memory: 512Mi }
+          readinessProbe:
+            httpGet: { path: /health/ready, port: http }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /health/live, port: http }
+            periodSeconds: 10
+          startupProbe:
+            httpGet: { path: /health/live, port: http }
+            failureThreshold: 30
+            periodSeconds: 2
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          volumeMounts: [{ name: tmp, mountPath: /tmp }]
+      volumes: [{ name: tmp, emptyDir: {} }]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: myshop-api
+spec:
+  selector: { app: myshop-api }
+  ports: [{ port: 80, targetPort: http, name: http }]
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: myshop-api
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: myshop-api }
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource: { name: cpu, target: { type: Utilization, averageUtilization: 65 } }
+  behavior:
+    scaleDown: { stabilizationWindowSeconds: 300 }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: myshop-api
+spec:
+  minAvailable: 2
+  selector: { matchLabels: { app: myshop-api } }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: myshop-api-config
+data:
+  ASPNETCORE_ENVIRONMENT: Production
+  Database__Provider: SqlServer
+  Database__AutoCreate: "false"
+  Elasticsearch__Url: http://elasticsearch:9200
+  App__FrontendUrl: https://shop.example.com
+  App__CorsOrigins__0: https://shop.example.com
+  Webhooks__EnableMockPay: "false"
+  Seed__Enabled: "false"

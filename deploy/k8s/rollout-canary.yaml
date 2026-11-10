@@ -1,0 +1,48 @@
+# Tuỳ chọn: thay Deployment myshop-api bằng Argo Rollouts canary có phân tích SLO tự động.
+# Áp dụng khi cluster đã cài Argo Rollouts: kubectl apply -f rollout-canary.yaml (và xoá Deployment cùng tên).
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: myshop-api
+spec:
+  replicas: 3
+  selector:
+    matchLabels: { app: myshop-api }
+  workloadRef: { apiVersion: apps/v1, kind: Deployment, name: myshop-api }
+  strategy:
+    canary:
+      steps:
+        - setWeight: 10
+        - analysis: { templates: [{ templateName: api-slo }] }
+        - setWeight: 50
+        - pause: { duration: 5m }
+        - analysis: { templates: [{ templateName: api-slo }] }
+        - setWeight: 100
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: api-slo
+spec:
+  metrics:
+    - name: error-rate
+      interval: 1m
+      count: 5
+      failureLimit: 1
+      successCondition: result[0] < 0.01
+      provider:
+        prometheus:
+          address: http://prometheus.monitoring:9090
+          query: |
+            sum(rate(http_requests_received_total{app="myshop-api",code=~"5.."}[2m]))
+            / sum(rate(http_requests_received_total{app="myshop-api"}[2m]))
+    - name: p95-latency
+      interval: 1m
+      count: 5
+      failureLimit: 1
+      successCondition: result[0] < 0.2
+      provider:
+        prometheus:
+          address: http://prometheus.monitoring:9090
+          query: |
+            histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{app="myshop-api"}[2m])))

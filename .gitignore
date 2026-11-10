@@ -1,0 +1,14 @@
+.env
+*.db
+*.db-shm
+*.db-wal
+bin/
+obj/
+TestResults/
+node_modules/
+.next/
+out/
+.vs/
+.idea/
+*.user
+.DS_Store

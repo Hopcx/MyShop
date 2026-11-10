@@ -1,0 +1,57 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: myshop-web
+  labels: { app: myshop-web }
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxSurge: 1, maxUnavailable: 0 }
+  selector:
+    matchLabels: { app: myshop-web }
+  template:
+    metadata:
+      labels: { app: myshop-web }
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: web
+          image: ghcr.io/OWNER/myshop-web:latest
+          ports: [{ containerPort: 3000, name: http }]
+          env:
+            - { name: API_INTERNAL_URL, value: http://myshop-api }
+          resources:
+            requests: { cpu: 200m, memory: 256Mi }
+            limits: { memory: 512Mi }
+          readinessProbe:
+            httpGet: { path: /robots.txt, port: http }
+          livenessProbe:
+            httpGet: { path: /robots.txt, port: http }
+            periodSeconds: 15
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: [ALL] }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: myshop-web
+spec:
+  selector: { app: myshop-web }
+  ports: [{ port: 80, targetPort: http, name: http }]
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: myshop-web
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: myshop-web }
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource: { name: cpu, target: { type: Utilization, averageUtilization: 70 } }

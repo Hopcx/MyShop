@@ -1,0 +1,20 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "api",
+      "runtimeExecutable": "dotnet",
+      "runtimeArgs": ["run", "--project", "backend/src/MyShop.Api", "--launch-profile", "http", "--urls", "http://localhost:5080"],
+      "env": { "ASPNETCORE_ENVIRONMENT": "Development" },
+      "port": 5080,
+      "url": "http://localhost:5080"
+    },
+    {
+      "name": "web",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["--prefix", "web", "run", "dev"],
+      "env": { "NEXT_PUBLIC_API_URL": "http://localhost:5080" },
+      "port": 3000
+    }
+  ]
+}

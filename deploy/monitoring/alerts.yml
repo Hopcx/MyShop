@@ -1,0 +1,51 @@
+# SLO:
+#   - Availability API: 99.9% request không lỗi 5xx (30 ngày) → error budget 0.1%
+#   - Latency catalog: p95 < 200ms cho GET /api/v1/products*
+# Cảnh báo theo multi-window burn rate (Google SRE workbook).
+groups:
+  - name: myshop-slo
+    rules:
+      - record: slo:api_error_ratio:rate5m
+        expr: |
+          sum(rate(http_requests_received_total{app="myshop-api",code=~"5.."}[5m]))
+          / clamp_min(sum(rate(http_requests_received_total{app="myshop-api"}[5m])), 1e-9)
+      - record: slo:api_error_ratio:rate1h
+        expr: |
+          sum(rate(http_requests_received_total{app="myshop-api",code=~"5.."}[1h]))
+          / clamp_min(sum(rate(http_requests_received_total{app="myshop-api"}[1h])), 1e-9)
+      - record: slo:catalog_latency_p95:5m
+        expr: |
+          histogram_quantile(0.95, sum by (le) (
+            rate(http_request_duration_seconds_bucket{app="myshop-api",controller="Catalog"}[5m])))
+
+      - alert: ApiErrorBudgetFastBurn
+        expr: slo:api_error_ratio:rate5m > (14.4 * 0.001) and slo:api_error_ratio:rate1h > (14.4 * 0.001)
+        for: 2m
+        labels: { severity: page }
+        annotations:
+          summary: "API đốt error budget nhanh (>14.4x) — 2% budget/giờ"
+          runbook: "docs/runbook.md#api-5xx-tăng-cao"
+
+      - alert: CatalogLatencyHigh
+        expr: slo:catalog_latency_p95:5m > 0.2
+        for: 10m
+        labels: { severity: ticket }
+        annotations:
+          summary: "p95 trang danh mục > 200ms trong 10 phút"
+          runbook: "docs/runbook.md#độ-trễ-catalog-cao"
+
+      - alert: OutboxBacklog
+        expr: increase(myshop_outbox_processed_total{result="error"}[15m]) > 20
+        for: 5m
+        labels: { severity: ticket }
+        annotations:
+          summary: "Outbox xử lý lỗi liên tục (email/search/kho có thể bị trễ)"
+          runbook: "docs/runbook.md#outbox-tồn-đọng"
+
+      - alert: ApiDown
+        expr: up{job="myshop-api"} == 0
+        for: 1m
+        labels: { severity: page }
+        annotations:
+          summary: "API không scrape được"
+          runbook: "docs/runbook.md#api-không-phản-hồi"
